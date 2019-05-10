@@ -28,6 +28,7 @@ import com.tc.classloader.CommonComponent;
 
 import java.nio.ByteBuffer;
 import java.util.AbstractList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 
@@ -45,10 +46,10 @@ public class ServerStoreImpl implements ServerSideServerStore {
     this.store = new OffHeapServerStore(recoveredMaps, mapper);
   }
 
-  public ServerStoreImpl(ServerStoreConfiguration storeConfiguration, ResourcePageSource pageSource, KeySegmentMapper mapper) {
+  public ServerStoreImpl(ServerStoreConfiguration storeConfiguration, ResourcePageSource pageSource, KeySegmentMapper mapper, boolean writeBehindConfigured) {
     this.storeConfiguration = storeConfiguration;
     this.pageSource = pageSource;
-    this.store = new OffHeapServerStore(pageSource, mapper);
+    this.store = new OffHeapServerStore(pageSource, mapper, writeBehindConfigured);
   }
 
   public void setEvictionListener(ServerStoreEvictionListener listener) {
@@ -92,6 +93,11 @@ public class ServerStoreImpl implements ServerSideServerStore {
 
   public void put(long key, Chain chain) {
     store.put(key, chain);
+  }
+
+  @Override
+  public void remove(long key) {
+    store.remove(key);
   }
 
   @Override
@@ -192,5 +198,10 @@ public class ServerStoreImpl implements ServerSideServerStore {
       throw new OversizeMappingException("Payload (" + payLoad.remaining() +
                                          ") bigger than pool size (" + pageSource.getPool().getSize() + ")");
     }
+  }
+
+  @Override
+  public Iterator<Chain> iterator() {
+    return store.iterator();
   }
 }

@@ -16,6 +16,7 @@
 package org.ehcache.clustered.client.internal.store;
 
 import org.ehcache.clustered.client.config.ClusteredResourcePool;
+import org.ehcache.clustered.client.config.Timeouts;
 import org.ehcache.clustered.client.config.builders.ClusteredResourcePoolBuilder;
 import org.ehcache.clustered.client.internal.store.ServerStoreProxy.ServerCallback;
 import org.ehcache.clustered.common.Consistency;
@@ -23,28 +24,30 @@ import org.ehcache.clustered.common.internal.ServerStoreConfiguration;
 import org.ehcache.clustered.common.internal.store.Chain;
 import org.ehcache.config.units.MemoryUnit;
 import org.ehcache.impl.serialization.LongSerializer;
-import org.junit.Ignore;
 import org.junit.Test;
+import org.terracotta.exception.ConnectionClosedException;
 
 import java.util.List;
-import java.util.concurrent.Callable;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
-import static org.ehcache.clustered.common.internal.store.Util.chainsEqual;
-import static org.ehcache.clustered.common.internal.store.Util.createPayload;
+import static org.ehcache.clustered.ChainUtils.createPayload;
+import static org.ehcache.clustered.Matchers.matchesChain;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.core.Is.is;
 import static org.hamcrest.core.IsInstanceOf.instanceOf;
 import static org.junit.Assert.fail;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 public class StrongServerStoreProxyTest extends AbstractServerStoreProxyTest {
 
@@ -53,7 +56,7 @@ public class StrongServerStoreProxyTest extends AbstractServerStoreProxyTest {
 
     ServerStoreConfiguration serverStoreConfiguration = new ServerStoreConfiguration(resourcePool.getPoolAllocation(), Long.class.getName(),
       Long.class.getName(), LongSerializer.class.getName(), LongSerializer.class
-      .getName(), Consistency.STRONG);
+      .getName(), Consistency.STRONG, false);
 
     return createClientEntity(name, serverStoreConfiguration, create);
   }
@@ -78,7 +81,7 @@ public class StrongServerStoreProxyTest extends AbstractServerStoreProxyTest {
       }
 
       @Override
-      public Chain compact(Chain chain) {
+      public void compact(ServerStoreProxy.ChainEntry chain) {
         throw new AssertionError();
       }
     });
@@ -94,8 +97,7 @@ public class StrongServerStoreProxyTest extends AbstractServerStoreProxyTest {
       }
 
       @Override
-      public Chain compact(Chain chain) {
-        return chain;
+      public void compact(ServerStoreProxy.ChainEntry chain) {
       }
     });
 
@@ -109,7 +111,7 @@ public class StrongServerStoreProxyTest extends AbstractServerStoreProxyTest {
     for (int i = 0; i < ITERATIONS; i++) {
       Chain elements1 = serverStoreProxy1.get(i);
       Chain elements2 = serverStoreProxy2.get(i);
-      assertThat(chainsEqual(elements1, elements2), is(true));
+      assertThat(elements2, matchesChain(elements2));
       if (!elements1.isEmpty()) {
         entryCount++;
       } else {
@@ -145,7 +147,7 @@ public class StrongServerStoreProxyTest extends AbstractServerStoreProxyTest {
       }
 
       @Override
-      public Chain compact(Chain chain) {
+      public void compact(ServerStoreProxy.ChainEntry chain) {
         throw new AssertionError();
       }
     });
@@ -184,7 +186,7 @@ public class StrongServerStoreProxyTest extends AbstractServerStoreProxyTest {
       }
 
       @Override
-      public Chain compact(Chain chain) {
+      public void compact(ServerStoreProxy.ChainEntry chain) {
         throw new AssertionError();
       }
     });
@@ -228,7 +230,7 @@ public class StrongServerStoreProxyTest extends AbstractServerStoreProxyTest {
       }
 
       @Override
-      public Chain compact(Chain chain) {
+      public void compact(ServerStoreProxy.ChainEntry chain) {
         throw new AssertionError();
       }
     });
@@ -258,7 +260,7 @@ public class StrongServerStoreProxyTest extends AbstractServerStoreProxyTest {
       }
 
       @Override
-      public Chain compact(Chain chain) {
+      public void compact(ServerStoreProxy.ChainEntry chain) {
         throw new AssertionError();
       }
     });
@@ -298,7 +300,7 @@ public class StrongServerStoreProxyTest extends AbstractServerStoreProxyTest {
       }
 
       @Override
-      public Chain compact(Chain chain) {
+      public void compact(ServerStoreProxy.ChainEntry chain) {
         throw new AssertionError();
       }
     });
@@ -340,7 +342,7 @@ public class StrongServerStoreProxyTest extends AbstractServerStoreProxyTest {
       }
 
       @Override
-      public Chain compact(Chain chain) {
+      public void compact(ServerStoreProxy.ChainEntry chain) {
         throw new AssertionError();
       }
     });
@@ -371,7 +373,7 @@ public class StrongServerStoreProxyTest extends AbstractServerStoreProxyTest {
       }
 
       @Override
-      public Chain compact(Chain chain) {
+      public void compact(ServerStoreProxy.ChainEntry chain) {
         throw new AssertionError();
       }
     });
@@ -383,4 +385,39 @@ public class StrongServerStoreProxyTest extends AbstractServerStoreProxyTest {
       assertThat(re.getCause(), instanceOf(IllegalStateException.class));
     }
   }
+
+  @Test
+  public void testAppendThrowsConnectionClosedExceptionDuringHashInvalidation() throws Exception {
+    SimpleClusterTierClientEntity clientEntity1 = mock(SimpleClusterTierClientEntity.class);
+    StrongServerStoreProxy serverStoreProxy1 = new StrongServerStoreProxy("testAppendThrowsConnectionClosedExceptionDuringHashInvalidation", clientEntity1, mock(ServerCallback.class));
+    doThrow(new ConnectionClosedException("Test")).when(clientEntity1).invokeAndWaitForReceive(any(), anyBoolean());
+    when(clientEntity1.getTimeouts()).thenReturn(Timeouts.DEFAULT);
+    when(clientEntity1.isConnected()).thenReturn(true);
+    try {
+      serverStoreProxy1.append(1L, createPayload(1L));
+      fail("Expected ServerStoreProxyException");
+    } catch (ServerStoreProxyException e) {
+      assertThat(e.getCause(), instanceOf(ConnectionClosedException.class));
+    } catch (RuntimeException e) {
+      fail("Expected ServerStoreProxyException");
+    }
+  }
+
+  @Test
+  public void testClearThrowsConnectionClosedExceptionDuringAllInvaildation() throws Exception {
+    SimpleClusterTierClientEntity clientEntity1 = mock(SimpleClusterTierClientEntity.class);
+    StrongServerStoreProxy serverStoreProxy1 = new StrongServerStoreProxy("testClearThrowsConnectionClosedExceptionDuringAllInvaildation", clientEntity1, mock(ServerCallback.class));
+    doThrow(new ConnectionClosedException("Test")).when(clientEntity1).invokeAndWaitForRetired(any(), anyBoolean());
+    when(clientEntity1.getTimeouts()).thenReturn(Timeouts.DEFAULT);
+    when(clientEntity1.isConnected()).thenReturn(true);
+    try {
+      serverStoreProxy1.clear();
+      fail("Expected ServerStoreProxyException");
+    } catch (ServerStoreProxyException e) {
+      assertThat(e.getCause(), instanceOf(ConnectionClosedException.class));
+    } catch (RuntimeException e) {
+      fail("Expected ServerStoreProxyException");
+    }
+  }
+
 }

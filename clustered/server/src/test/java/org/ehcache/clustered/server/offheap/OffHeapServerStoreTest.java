@@ -25,6 +25,7 @@ import org.ehcache.clustered.server.store.ChainBuilder;
 import org.ehcache.clustered.server.store.ElementBuilder;
 import org.ehcache.clustered.common.internal.store.ServerStore;
 import org.ehcache.clustered.server.store.ServerStoreTest;
+import org.junit.Assert;
 import org.junit.Test;
 import org.mockito.invocation.InvocationOnMock;
 import org.mockito.stubbing.Answer;
@@ -35,11 +36,12 @@ import org.terracotta.offheapstore.paging.UpfrontAllocatingPageSource;
 
 import static java.util.Arrays.asList;
 import static java.util.Collections.singletonList;
+import static org.ehcache.clustered.ChainUtils.chainOf;
+import static org.ehcache.clustered.ChainUtils.createPayload;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.lessThanOrEqualTo;
 import static org.hamcrest.core.Is.is;
-import org.junit.Assert;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.doNothing;
@@ -73,7 +75,7 @@ public class OffHeapServerStoreTest extends ServerStoreTest {
 
   @Override
   public ServerStore newStore() {
-    return new OffHeapServerStore(new UnlimitedPageSource(new OffHeapBufferSource()), DEFAULT_MAPPER);
+    return new OffHeapServerStore(new UnlimitedPageSource(new OffHeapBufferSource()), DEFAULT_MAPPER, false);
   }
 
   @Override
@@ -83,13 +85,13 @@ public class OffHeapServerStoreTest extends ServerStoreTest {
       for (int i = 0; i < buffers.length; i++) {
         buffers[i] = elements[i].getPayload();
       }
-      return OffHeapChainMap.chain(buffers);
+      return chainOf(buffers);
     };
   }
 
   @Override
   public ElementBuilder newElementBuilder() {
-    return payLoad -> () -> payLoad;
+    return payLoad -> () -> payLoad.asReadOnlyBuffer();
   }
 
   @Test
@@ -265,7 +267,7 @@ public class OffHeapServerStoreTest extends ServerStoreTest {
     long seed = System.nanoTime();
     Random random = new Random(seed);
     try {
-      OffHeapServerStore store = new OffHeapServerStore(new UpfrontAllocatingPageSource(new OffHeapBufferSource(), MEGABYTES.toBytes(1L), MEGABYTES.toBytes(1)), DEFAULT_MAPPER);
+      OffHeapServerStore store = new OffHeapServerStore(new UpfrontAllocatingPageSource(new OffHeapBufferSource(), MEGABYTES.toBytes(1L), MEGABYTES.toBytes(1)), DEFAULT_MAPPER, false);
 
       ByteBuffer smallValue = ByteBuffer.allocate(1024);
       for (int i = 0; i < 10000; i++) {
@@ -293,7 +295,7 @@ public class OffHeapServerStoreTest extends ServerStoreTest {
   public void testServerSideUsageStats() {
 
     long maxBytes = MEGABYTES.toBytes(1);
-    OffHeapServerStore store = new OffHeapServerStore(new UpfrontAllocatingPageSource(new OffHeapBufferSource(), maxBytes, MEGABYTES.toBytes(1)), new KeySegmentMapper(16));
+    OffHeapServerStore store = new OffHeapServerStore(new UpfrontAllocatingPageSource(new OffHeapBufferSource(), maxBytes, MEGABYTES.toBytes(1)), new KeySegmentMapper(16), false);
 
     int oneKb = 1024;
     long smallLoopCount = 5;

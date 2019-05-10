@@ -35,8 +35,13 @@ import org.ehcache.clustered.common.internal.messages.ServerStoreOpMessage.Appen
 import org.ehcache.clustered.common.internal.messages.ServerStoreOpMessage.ClientInvalidationAck;
 import org.ehcache.clustered.common.internal.messages.ServerStoreOpMessage.ClientInvalidationAllAck;
 import org.ehcache.clustered.common.internal.messages.ServerStoreOpMessage.GetMessage;
+import org.ehcache.clustered.common.internal.messages.ServerStoreOpMessage.IteratorAdvanceMessage;
+import org.ehcache.clustered.common.internal.messages.ServerStoreOpMessage.IteratorCloseMessage;
+import org.ehcache.clustered.common.internal.messages.ServerStoreOpMessage.IteratorOpenMessage;
 import org.ehcache.clustered.common.internal.messages.ServerStoreOpMessage.KeyBasedServerStoreOpMessage;
+import org.ehcache.clustered.common.internal.messages.ServerStoreOpMessage.LockMessage;
 import org.ehcache.clustered.common.internal.messages.ServerStoreOpMessage.ReplaceAtHeadMessage;
+import org.ehcache.clustered.common.internal.messages.ServerStoreOpMessage.UnlockMessage;
 import org.ehcache.clustered.common.internal.messages.StateRepositoryOpMessage;
 import org.ehcache.clustered.common.internal.store.Chain;
 import org.ehcache.clustered.common.internal.store.ClusterTierEntityConfiguration;
@@ -76,12 +81,14 @@ import org.terracotta.entity.ServiceRegistry;
 import org.terracotta.entity.StateDumpCollector;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -96,6 +103,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static java.util.Collections.emptyMap;
 import static java.util.stream.Collectors.toMap;
 import static java.util.stream.Collectors.toSet;
 import static org.ehcache.clustered.common.internal.messages.EhcacheEntityResponse.allInvalidationDone;
@@ -104,6 +112,9 @@ import static org.ehcache.clustered.common.internal.messages.EhcacheEntityRespon
 import static org.ehcache.clustered.common.internal.messages.EhcacheEntityResponse.failure;
 import static org.ehcache.clustered.common.internal.messages.EhcacheEntityResponse.getResponse;
 import static org.ehcache.clustered.common.internal.messages.EhcacheEntityResponse.hashInvalidationDone;
+import static org.ehcache.clustered.common.internal.messages.EhcacheEntityResponse.iteratorBatchResponse;
+import static org.ehcache.clustered.common.internal.messages.EhcacheEntityResponse.lockFailure;
+import static org.ehcache.clustered.common.internal.messages.EhcacheEntityResponse.lockSuccess;
 import static org.ehcache.clustered.common.internal.messages.EhcacheEntityResponse.resolveRequest;
 import static org.ehcache.clustered.common.internal.messages.EhcacheEntityResponse.serverInvalidateHash;
 import static org.ehcache.clustered.common.internal.messages.EhcacheEntityResponse.success;
@@ -150,7 +161,9 @@ public class ClusterTierActiveEntity implements ActiveServerEntity<EhcacheEntity
   private final Object inflightInvalidationsMutex = new Object();
   private volatile List<InvalidationTuple> inflightInvalidations;
   private final Map<ClientDescriptor, Boolean> connectedClients = new ConcurrentHashMap<>();
+  private final Map<ClientDescriptor, Map<UUID, Iterator<Chain>>> liveIterators = new ConcurrentHashMap<>();
   private final int chainCompactionLimit;
+  private final ServerLockManager lockManager;
 
   private final long dataSizeThreshold = Long.getLong(SYNC_DATA_SIZE_PROP, DEFAULT_SYNC_DATA_SIZE_THRESHOLD);
   private final int dataGetsThreshold = Integer.getInteger(SYNC_DATA_GETS_PROP, DEFAULT_SYNC_DATA_GETS_THRESHOLD);
@@ -178,6 +191,11 @@ public class ClusterTierActiveEntity implements ActiveServerEntity<EhcacheEntity
     }
     management = new ClusterTierManagement(registry, stateService, true, storeIdentifier, entityConfiguration.getManagerIdentifier());
     chainCompactionLimit = Integer.getInteger(CHAIN_COMPACTION_THRESHOLD_PROP, DEFAULT_CHAIN_COMPACTION_THRESHOLD);
+    if (configuration.isLoaderWriterConfigured()) {
+      lockManager = new LockManagerImpl();
+    } else {
+      lockManager = new NoopLockManager();
+    }
   }
 
   static boolean isTrackedMessage(EhcacheEntityMessage msg) {
@@ -259,6 +277,11 @@ public class ClusterTierActiveEntity implements ActiveServerEntity<EhcacheEntity
         it.remove();
       }
     }
+
+    lockManager.sweepLocksForClient(clientDescriptor,
+                                    configuration.isWriteBehindConfigured() ? null : heldKeys -> heldKeys.forEach(stateService.getStore(storeIdentifier)::remove));
+
+    liveIterators.remove(clientDescriptor);
 
     connectedClients.remove(clientDescriptor);
   }
@@ -359,7 +382,7 @@ public class ClusterTierActiveEntity implements ActiveServerEntity<EhcacheEntity
         try {
           return getResponse(cacheStore.get(getMessage.getKey()));
         } catch (TimeoutException e) {
-          throw new AssertionError("Server side store is not expected to throw timeout exception");
+          throw new AssertionError("Server side store is not expected to throw timeout exception", e);
         }
       }
       case APPEND: {
@@ -376,12 +399,15 @@ public class ClusterTierActiveEntity implements ActiveServerEntity<EhcacheEntity
           cacheStore.append(key, appendMessage.getPayload());
           newChain = cacheStore.get(key);
         } catch (TimeoutException e) {
-          throw new AssertionError("Server side store is not expected to throw timeout exception");
+          throw new AssertionError("Server side store is not expected to throw timeout exception", e);
         }
         sendMessageToSelfAndDeferRetirement(activeInvokeContext, appendMessage, newChain);
         invalidateHashForClient(clientDescriptor, key);
         if (newChain.length() > chainCompactionLimit) {
           requestChainResolution(clientDescriptor, key, newChain);
+        }
+        if (!configuration.isWriteBehindConfigured()) {
+          lockManager.unlock(key);
         }
         return success();
       }
@@ -400,7 +426,7 @@ public class ClusterTierActiveEntity implements ActiveServerEntity<EhcacheEntity
           result = cacheStore.getAndAppend(getAndAppendMessage.getKey(), getAndAppendMessage.getPayload());
           newChain = cacheStore.get(getAndAppendMessage.getKey());
         } catch (TimeoutException e) {
-          throw new AssertionError("Server side store is not expected to throw timeout exception");
+          throw new AssertionError("Server side store is not expected to throw timeout exception", e);
         }
         sendMessageToSelfAndDeferRetirement(activeInvokeContext, getAndAppendMessage, newChain);
         LOGGER.debug("Send invalidations for key {}", getAndAppendMessage.getKey());
@@ -431,7 +457,7 @@ public class ClusterTierActiveEntity implements ActiveServerEntity<EhcacheEntity
         try {
           cacheStore.clear();
         } catch (TimeoutException e) {
-          throw new AssertionError("Server side store is not expected to throw timeout exception");
+          throw new AssertionError("Server side store is not expected to throw timeout exception", e);
         }
 
         InvalidationTracker invalidationTracker = stateService.getInvalidationTracker(storeIdentifier);
@@ -441,9 +467,92 @@ public class ClusterTierActiveEntity implements ActiveServerEntity<EhcacheEntity
         invalidateAll(clientDescriptor);
         return success();
       }
+      case LOCK: {
+        LockMessage lockMessage = (LockMessage) message;
+        if (lockManager.lock(lockMessage.getHash(), activeInvokeContext.getClientDescriptor())) {
+          try {
+            Chain chain = cacheStore.get(lockMessage.getHash());
+            return lockSuccess(chain);
+          } catch (TimeoutException e) {
+            throw new AssertionError("Server side store is not expected to throw timeout exception", e);
+          }
+        } else {
+          return lockFailure();
+        }
+      }
+      case UNLOCK: {
+        UnlockMessage unlockMessage = (UnlockMessage) message;
+        lockManager.unlock(unlockMessage.getHash());
+        return success();
+      }
+      case ITERATOR_OPEN: {
+        IteratorOpenMessage iteratorOpenMessage = (IteratorOpenMessage) message;
+        try {
+          Iterator<Chain> iterator = cacheStore.iterator();
+          List<Chain> batch = iteratorBatch(iterator, iteratorOpenMessage.getBatchSize());
+
+          if (iterator.hasNext()) {
+            Map<UUID, Iterator<Chain>> liveIterators = this.liveIterators.computeIfAbsent(clientDescriptor, client -> new ConcurrentHashMap<>());
+            UUID id;
+            do {
+              id = UUID.randomUUID();
+            } while (liveIterators.putIfAbsent(id, iterator) != null);
+            return iteratorBatchResponse(id, batch, false);
+          } else {
+            return iteratorBatchResponse(UUID.randomUUID(), batch, true);
+          }
+        } catch (TimeoutException e) {
+          throw new AssertionError("Server side store is not expected to throw timeout exception", e);
+        }
+      }
+      case ITERATOR_CLOSE: {
+        IteratorCloseMessage iteratorCloseMessage = (IteratorCloseMessage) message;
+        liveIterators.computeIfPresent(clientDescriptor, (client, iterators) -> {
+          iterators.remove(iteratorCloseMessage.getIdentity());
+          if (iterators.isEmpty()) {
+            return null;
+          } else {
+            return iterators;
+          }
+        });
+        return success();
+      }
+      case ITERATOR_ADVANCE: {
+        IteratorAdvanceMessage iteratorAdvanceMessage = (IteratorAdvanceMessage) message;
+        UUID id = iteratorAdvanceMessage.getIdentity();
+
+        Iterator<Chain> iterator = liveIterators.getOrDefault(clientDescriptor, emptyMap()).get(id);
+        if (iterator == null) {
+          return failure(new InvalidOperationException("Referenced iterator is already closed (or never existed)"));
+        } else {
+          List<Chain> batch = iteratorBatch(iterator, iteratorAdvanceMessage.getBatchSize());
+          if (iterator.hasNext()) {
+            return iteratorBatchResponse(id, batch, false);
+          } else {
+            liveIterators.computeIfPresent(clientDescriptor, (client, iterators) -> {
+              iterators.remove(id);
+              return iterators.isEmpty() ? null : iterators;
+            });
+            return iteratorBatchResponse(id, batch, true);
+          }
+        }
+      }
       default:
         throw new AssertionError("Unsupported ServerStore operation : " + message);
     }
+  }
+
+  private List<Chain> iteratorBatch(Iterator<Chain> iterator, int batchSize) {
+    List<Chain> chains = new ArrayList<>();
+    int size = 0;
+    while (iterator.hasNext() && size < batchSize && size >= 0) {
+      Chain nextChain = iterator.next();
+      chains.add(nextChain);
+      for (Element e: nextChain) {
+        size += e.getPayload().remaining();
+      }
+    }
+    return chains;
   }
 
   private void invalidateAll(ClientDescriptor originatingClientDescriptor) {
@@ -592,6 +701,7 @@ public class ClusterTierActiveEntity implements ActiveServerEntity<EhcacheEntity
       ClusterTierReconnectMessage reconnectMessage = reconnectMessageCodec.decode(bytes);
       ServerSideServerStore serverStore = stateService.getStore(storeIdentifier);
       addInflightInvalidationsForStrongCache(clientDescriptor, reconnectMessage, serverStore);
+      lockManager.createLockStateAfterFailover(clientDescriptor, reconnectMessage.getLocksHeld());
 
       LOGGER.info("Client '{}' successfully reconnected to newly promoted ACTIVE after failover.", clientDescriptor);
 
@@ -797,14 +907,15 @@ public class ClusterTierActiveEntity implements ActiveServerEntity<EhcacheEntity
     } catch (ClusterException e) {
       LOGGER.error("Failed to destroy server store - does not exist", e);
     }
+    messageHandler.destroy();
     management.close();
   }
 
-  Set<ClientDescriptor> getConnectedClients() {
+  protected Set<ClientDescriptor> getConnectedClients() {
     return connectedClients.keySet();
   }
 
-  Set<ClientDescriptor> getValidatedClients() {
+  protected Set<ClientDescriptor> getValidatedClients() {
     return connectedClients.entrySet().stream().filter(Map.Entry::getValue).map(Map.Entry::getKey).collect(toSet());
   }
 
