@@ -16,17 +16,13 @@
 package org.ehcache.clustered.client.internal.store;
 
 import org.ehcache.clustered.Matchers;
-import org.ehcache.clustered.client.config.ClusteredResourcePool;
-import org.ehcache.clustered.client.config.builders.ClusteredResourcePoolBuilder;
 import org.ehcache.clustered.client.internal.store.ServerStoreProxy.ServerCallback;
 import org.ehcache.clustered.common.Consistency;
-import org.ehcache.clustered.common.internal.ServerStoreConfiguration;
 import org.ehcache.clustered.common.internal.store.Chain;
 import org.ehcache.clustered.server.store.ObservableClusterTierServerEntityService.ObservableClusterTierActiveEntity;
-import org.ehcache.config.units.MemoryUnit;
-import org.ehcache.impl.serialization.LongSerializer;
 import org.junit.Test;
 
+import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -43,32 +39,29 @@ import static org.mockito.Mockito.mock;
 
 public class EventualServerStoreProxyTest extends AbstractServerStoreProxyTest {
 
-  private static SimpleClusterTierClientEntity createClientEntity(String name, boolean create) throws Exception {
-    ClusteredResourcePool resourcePool = ClusteredResourcePoolBuilder.clusteredDedicated(8L, MemoryUnit.MB);
-
-    ServerStoreConfiguration serverStoreConfiguration = new ServerStoreConfiguration(resourcePool.getPoolAllocation(), Long.class.getName(),
-        Long.class.getName(), LongSerializer.class.getName(), LongSerializer.class
-        .getName(), Consistency.EVENTUAL, false);
-
-    return createClientEntity(name, serverStoreConfiguration, create);
-  }
-
   @Test
   public void testServerSideEvictionFiresInvalidations() throws Exception {
-    SimpleClusterTierClientEntity clientEntity1 = createClientEntity("testServerSideEvictionFiresInvalidations", true);
-    SimpleClusterTierClientEntity clientEntity2 = createClientEntity("testServerSideEvictionFiresInvalidations", false);
+    SimpleClusterTierClientEntity clientEntity1 = createClientEntity("testServerSideEvictionFiresInvalidations", Consistency.EVENTUAL, true);
+    SimpleClusterTierClientEntity clientEntity2 = createClientEntity("testServerSideEvictionFiresInvalidations", Consistency.EVENTUAL, false);
 
     final List<Long> store1InvalidatedHashes = new CopyOnWriteArrayList<>();
+    final AtomicBoolean store1InvalidatedAll = new AtomicBoolean();
     final List<Long> store2InvalidatedHashes = new CopyOnWriteArrayList<>();
+    final AtomicBoolean store2InvalidatedAll = new AtomicBoolean();
 
     EventualServerStoreProxy serverStoreProxy1 = new EventualServerStoreProxy("testServerSideEvictionFiresInvalidations", clientEntity1, new ServerCallback() {
       @Override
-      public void onInvalidateHash(long hash) {
+      public void onInvalidateHash(long hash, Chain evictedChain) {
         store1InvalidatedHashes.add(hash);
       }
 
       @Override
       public void onInvalidateAll() {
+        store1InvalidatedAll.set(true);
+      }
+
+      @Override
+      public void onAppend(Chain beforeAppend, ByteBuffer appended) {
         fail("should not be called");
       }
 
@@ -79,12 +72,17 @@ public class EventualServerStoreProxyTest extends AbstractServerStoreProxyTest {
     });
     EventualServerStoreProxy serverStoreProxy2 = new EventualServerStoreProxy("testServerSideEvictionFiresInvalidations", clientEntity2, new ServerCallback() {
       @Override
-      public void onInvalidateHash(long hash) {
+      public void onInvalidateHash(long hash, Chain evictedChain) {
         store2InvalidatedHashes.add(hash);
       }
 
       @Override
       public void onInvalidateAll() {
+        store2InvalidatedAll.set(true);
+      }
+
+      @Override
+      public void onAppend(Chain beforeAppend, ByteBuffer appended) {
         fail("should not be called");
       }
 
@@ -119,27 +117,36 @@ public class EventualServerStoreProxyTest extends AbstractServerStoreProxyTest {
     assertThat(store2InvalidatedHashes.size(), is(ITERATIONS + evictionCount));
 
     assertThatClientsWaitingForInvalidationIsEmpty("testServerSideEvictionFiresInvalidations");
+
+    assertThat(store1InvalidatedAll.get(), is(false));
+    assertThat(store2InvalidatedAll.get(), is(false));
   }
 
   @Test
   public void testHashInvalidationListenerWithAppend() throws Exception {
-    SimpleClusterTierClientEntity clientEntity1 = createClientEntity("testHashInvalidationListenerWithAppend", true);
-    SimpleClusterTierClientEntity clientEntity2 = createClientEntity("testHashInvalidationListenerWithAppend", false);
+    SimpleClusterTierClientEntity clientEntity1 = createClientEntity("testHashInvalidationListenerWithAppend", Consistency.EVENTUAL, true);
+    SimpleClusterTierClientEntity clientEntity2 = createClientEntity("testHashInvalidationListenerWithAppend", Consistency.EVENTUAL, false);
 
     final CountDownLatch latch = new CountDownLatch(1);
     final AtomicReference<Long> invalidatedHash = new AtomicReference<>();
+    final AtomicBoolean invalidatedAll = new AtomicBoolean();
 
 
     EventualServerStoreProxy serverStoreProxy1 = new EventualServerStoreProxy("testHashInvalidationListenerWithAppend", clientEntity1, new ServerCallback() {
       @Override
-      public void onInvalidateHash(long hash) {
+      public void onInvalidateHash(long hash, Chain evictedChain) {
         invalidatedHash.set(hash);
         latch.countDown();
       }
 
       @Override
       public void onInvalidateAll() {
-        throw new AssertionError("Should not be called");
+        invalidatedAll.set(true);
+      }
+
+      @Override
+      public void onAppend(Chain beforeAppend, ByteBuffer appended) {
+        fail("should not be called");
       }
 
       @Override
@@ -154,27 +161,34 @@ public class EventualServerStoreProxyTest extends AbstractServerStoreProxyTest {
     latch.await(5, TimeUnit.SECONDS);
     assertThat(invalidatedHash.get(), is(1L));
     assertThatClientsWaitingForInvalidationIsEmpty("testHashInvalidationListenerWithAppend");
+    assertThat(invalidatedAll.get(), is(false));
   }
 
   @Test
   public void testHashInvalidationListenerWithGetAndAppend() throws Exception {
-    SimpleClusterTierClientEntity clientEntity1 = createClientEntity("testHashInvalidationListenerWithGetAndAppend", true);
-    SimpleClusterTierClientEntity clientEntity2 = createClientEntity("testHashInvalidationListenerWithGetAndAppend", false);
+    SimpleClusterTierClientEntity clientEntity1 = createClientEntity("testHashInvalidationListenerWithGetAndAppend", Consistency.EVENTUAL, true);
+    SimpleClusterTierClientEntity clientEntity2 = createClientEntity("testHashInvalidationListenerWithGetAndAppend", Consistency.EVENTUAL, false);
 
     final CountDownLatch latch = new CountDownLatch(1);
     final AtomicReference<Long> invalidatedHash = new AtomicReference<>();
+    final AtomicBoolean invalidatedAll = new AtomicBoolean();
 
 
     EventualServerStoreProxy serverStoreProxy1 = new EventualServerStoreProxy("testHashInvalidationListenerWithGetAndAppend", clientEntity1, new ServerCallback() {
       @Override
-      public void onInvalidateHash(long hash) {
+      public void onInvalidateHash(long hash, Chain evictedChain) {
         invalidatedHash.set(hash);
         latch.countDown();
       }
 
       @Override
       public void onInvalidateAll() {
-        throw new AssertionError("Should not be called");
+        invalidatedAll.set(true);
+      }
+
+      @Override
+      public void onAppend(Chain beforeAppend, ByteBuffer appended) {
+        fail("should not be called");
       }
 
       @Override
@@ -189,19 +203,20 @@ public class EventualServerStoreProxyTest extends AbstractServerStoreProxyTest {
     latch.await(5, TimeUnit.SECONDS);
     assertThat(invalidatedHash.get(), is(1L));
     assertThatClientsWaitingForInvalidationIsEmpty("testHashInvalidationListenerWithGetAndAppend");
+    assertThat(invalidatedAll.get(), is(false));
   }
 
   @Test
   public void testAllInvalidationListener() throws Exception {
-    SimpleClusterTierClientEntity clientEntity1 = createClientEntity("testAllInvalidationListener", true);
-    SimpleClusterTierClientEntity clientEntity2 = createClientEntity("testAllInvalidationListener", false);
+    SimpleClusterTierClientEntity clientEntity1 = createClientEntity("testAllInvalidationListener", Consistency.EVENTUAL, true);
+    SimpleClusterTierClientEntity clientEntity2 = createClientEntity("testAllInvalidationListener", Consistency.EVENTUAL, false);
 
     final CountDownLatch latch = new CountDownLatch(1);
     final AtomicBoolean invalidatedAll = new AtomicBoolean();
 
     EventualServerStoreProxy serverStoreProxy1 = new EventualServerStoreProxy("testAllInvalidationListener", clientEntity1, new ServerCallback() {
       @Override
-      public void onInvalidateHash(long hash) {
+      public void onInvalidateHash(long hash, Chain evictedChain) {
         throw new AssertionError("Should not be called");
       }
 
@@ -209,6 +224,11 @@ public class EventualServerStoreProxyTest extends AbstractServerStoreProxyTest {
       public void onInvalidateAll() {
         invalidatedAll.set(true);
         latch.countDown();
+      }
+
+      @Override
+      public void onAppend(Chain beforeAppend, ByteBuffer appended) {
+        fail("should not be called");
       }
 
       @Override

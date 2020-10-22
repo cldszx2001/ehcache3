@@ -20,15 +20,18 @@ import org.ehcache.clustered.client.config.builders.ClusteredResourcePoolBuilder
 import org.ehcache.clustered.client.internal.store.ServerStoreProxy.ServerCallback;
 import org.ehcache.clustered.common.Consistency;
 import org.ehcache.clustered.common.internal.ServerStoreConfiguration;
+import org.ehcache.clustered.common.internal.store.Chain;
 import org.ehcache.config.units.MemoryUnit;
 import org.ehcache.impl.serialization.LongSerializer;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.nio.ByteBuffer;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.ehcache.clustered.ChainUtils.createPayload;
@@ -57,6 +60,7 @@ public class MultiThreadedStrongServerStoreProxyTest extends AbstractServerStore
     final AtomicReference<Long> invalidatedHash = new AtomicReference<>();
     SimpleClusterTierClientEntity clientEntity1 = createClientEntity(ENTITY_NAME, getServerStoreConfiguration(), true, true);
     StrongServerStoreProxy serverStoreProxy1 = new StrongServerStoreProxy(ENTITY_NAME, clientEntity1, mock(ServerCallback.class));
+    AtomicBoolean invalidatedAll = new AtomicBoolean();
 
     ExecutorService executor =  Executors.newSingleThreadExecutor();
     CountDownLatch beforeValidationLatch = new CountDownLatch(1);
@@ -66,12 +70,17 @@ public class MultiThreadedStrongServerStoreProxyTest extends AbstractServerStore
         SimpleClusterTierClientEntity clientEntity2 = createClientEntity(ENTITY_NAME, getServerStoreConfiguration(), false, false);
         StrongServerStoreProxy serverStoreProxy2 = new StrongServerStoreProxy(ENTITY_NAME, clientEntity2, new ServerCallback() {
           @Override
-          public void onInvalidateHash(long hash) {
+          public void onInvalidateHash(long hash, Chain evictedChain) {
             invalidatedHash.set(hash);
           }
 
           @Override
           public void onInvalidateAll() {
+            invalidatedAll.set(true);
+          }
+
+          @Override
+          public void onAppend(Chain beforeAppend, ByteBuffer appended) {
             throw new AssertionError("Should not be called");
           }
 
@@ -96,7 +105,7 @@ public class MultiThreadedStrongServerStoreProxyTest extends AbstractServerStore
     assertTrue(afterValidationLatch.await(MAX_WAIT_TIME_SECONDS, TimeUnit.SECONDS));
     serverStoreProxy1.append(1L, createPayload(1L));
     assertThat(invalidatedHash.get(), is(1L));
-
+    assertThat(invalidatedAll.get(), is(false));
     executor.shutdownNow();
   }
 }

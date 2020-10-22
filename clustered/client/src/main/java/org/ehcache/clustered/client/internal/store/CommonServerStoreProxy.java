@@ -16,9 +16,11 @@
 
 package org.ehcache.clustered.client.internal.store;
 
+import org.ehcache.clustered.common.internal.exceptions.ClusterException;
 import org.ehcache.clustered.common.internal.messages.EhcacheEntityResponse;
 import org.ehcache.clustered.common.internal.messages.EhcacheEntityResponse.ClientInvalidateAll;
 import org.ehcache.clustered.common.internal.messages.EhcacheEntityResponse.ClientInvalidateHash;
+import org.ehcache.clustered.common.internal.messages.EhcacheEntityResponse.ServerAppend;
 import org.ehcache.clustered.common.internal.messages.EhcacheEntityResponse.ServerInvalidateHash;
 import org.ehcache.clustered.common.internal.messages.EhcacheOperationMessage;
 import org.ehcache.clustered.common.internal.messages.EhcacheResponseType;
@@ -62,23 +64,28 @@ class CommonServerStoreProxy implements ServerStoreProxy {
 
     entity.addDisconnectionListener(invalidation::onInvalidateAll);
 
+    entity.addResponseListener(ServerAppend.class, response -> {
+      LOGGER.debug("CLIENT: on cache {}, server append notification", cacheId);
+      invalidation.onAppend(response.getBeforeAppend(), response.getAppended());
+    });
     entity.addResponseListener(ServerInvalidateHash.class, response -> {
       long key = response.getKey();
-      LOGGER.debug("CLIENT: on cache {}, server requesting hash {} to be invalidated", cacheId, key);
-      invalidation.onInvalidateHash(key);
+      Chain evictedChain = response.getEvictedChain();
+      LOGGER.debug("CLIENT: on cache {}, server requesting hash {} to be invalidated (evicted chain : {})", cacheId, key, evictedChain);
+      invalidation.onInvalidateHash(key, evictedChain);
     });
     entity.addResponseListener(ClientInvalidateHash.class, response -> {
       long key = response.getKey();
       int invalidationId = response.getInvalidationId();
 
       LOGGER.debug("CLIENT: doing work to invalidate hash {} from cache {} (ID {})", key, cacheId, invalidationId);
-      invalidation.onInvalidateHash(key);
+      // evicted chain is always null: ClientInvalidateHash is fired when another client did an append, not when the server evicted
+      invalidation.onInvalidateHash(key, null);
 
       try {
         LOGGER.debug("CLIENT: ack'ing invalidation of hash {} from cache {} (ID {})", key, cacheId, invalidationId);
         entity.invokeAndWaitForSend(new ClientInvalidationAck(key, invalidationId), false);
-      } catch (Exception e) {
-        //TODO: what should be done here?
+      } catch (ClusterException e) {
         LOGGER.error("error acking client invalidation of hash {} on cache {}", key, cacheId, e);
       }
     });
@@ -91,8 +98,7 @@ class CommonServerStoreProxy implements ServerStoreProxy {
       try {
         LOGGER.debug("CLIENT: ack'ing invalidation of all from cache {} (ID {})", cacheId, invalidationId);
         entity.invokeAndWaitForSend(new ClientInvalidationAllAck(invalidationId), false);
-      } catch (Exception e) {
-        //TODO: what should be done here?
+      } catch (ClusterException e) {
         LOGGER.error("error acking client invalidation of all on cache {}", cacheId, e);
       }
     });
@@ -162,6 +168,15 @@ class CommonServerStoreProxy implements ServerStoreProxy {
   }
 
   @Override
+  public void enableEvents(boolean enable) {
+    try {
+      entity.enableEvents(enable);
+    } catch (Exception e) {
+      throw new ServerStoreProxyException(e);
+    }
+  }
+
+  @Override
   public void replaceAtHead(long key, Chain expect, Chain update) {
     // TODO: Optimize this method to just send sequences for expect Chain
     try {
@@ -201,7 +216,7 @@ class CommonServerStoreProxy implements ServerStoreProxy {
 
         @Override
         public Chain next() {
-          if (batch.hasNext()) {
+          if (lastBatch || batch.hasNext()) {
             return batch.next();
           } else {
             try {

@@ -21,6 +21,7 @@ import org.ehcache.clustered.client.internal.store.ServerStoreProxy;
 import org.ehcache.clustered.client.internal.store.lock.LockingServerStoreProxy;
 import org.ehcache.clustered.client.internal.store.operations.ChainResolver;
 import org.ehcache.clustered.client.internal.store.operations.EternalChainResolver;
+import org.ehcache.clustered.client.service.ClusteringService;
 import org.ehcache.clustered.common.internal.store.operations.ConditionalRemoveOperation;
 import org.ehcache.clustered.common.internal.store.operations.ConditionalReplaceOperation;
 import org.ehcache.clustered.common.internal.store.operations.PutIfAbsentOperation;
@@ -28,12 +29,14 @@ import org.ehcache.clustered.common.internal.store.operations.PutOperation;
 import org.ehcache.clustered.common.internal.store.operations.RemoveOperation;
 import org.ehcache.clustered.common.internal.store.operations.ReplaceOperation;
 import org.ehcache.clustered.common.internal.store.operations.codecs.OperationsCodec;
-import org.ehcache.clustered.client.service.ClusteringService;
 import org.ehcache.config.ResourceType;
+import org.ehcache.core.events.StoreEventDispatcher;
 import org.ehcache.core.exceptions.StorePassThroughException;
+import org.ehcache.core.spi.service.StatisticsService;
 import org.ehcache.core.spi.store.tiering.AuthoritativeTier;
 import org.ehcache.core.spi.time.TimeSource;
 import org.ehcache.core.spi.time.TimeSourceService;
+import org.ehcache.impl.store.DefaultStoreEventDispatcher;
 import org.ehcache.spi.loaderwriter.CacheLoaderWriter;
 import org.ehcache.spi.loaderwriter.CacheLoaderWriterConfiguration;
 import org.ehcache.spi.loaderwriter.CacheLoadingException;
@@ -55,8 +58,8 @@ public class ClusteredLoaderWriterStore<K, V> extends ClusteredStore<K, V> imple
   private final boolean useLoaderInAtomics;
 
   public ClusteredLoaderWriterStore(Configuration<K, V> config, OperationsCodec<K, V> codec, ChainResolver<K, V> resolver, TimeSource timeSource,
-                                    CacheLoaderWriter<? super K, V> loaderWriter, boolean useLoaderInAtomics) {
-    super(config, codec, resolver, timeSource);
+                                    CacheLoaderWriter<? super K, V> loaderWriter, boolean useLoaderInAtomics, StoreEventDispatcher<K, V> storeEventDispatcher, StatisticsService statisticsService) {
+    super(config, codec, resolver, timeSource, storeEventDispatcher, statisticsService);
     this.cacheLoaderWriter = loaderWriter;
     this.useLoaderInAtomics = useLoaderInAtomics;
   }
@@ -65,8 +68,8 @@ public class ClusteredLoaderWriterStore<K, V> extends ClusteredStore<K, V> imple
    * For Tests
    */
   ClusteredLoaderWriterStore(Configuration<K, V> config, OperationsCodec<K, V> codec, EternalChainResolver<K, V> resolver,
-                             ServerStoreProxy proxy, TimeSource timeSource, CacheLoaderWriter<? super K, V> loaderWriter) {
-    super(config, codec, resolver, proxy, timeSource);
+                             ServerStoreProxy proxy, TimeSource timeSource, CacheLoaderWriter<? super K, V> loaderWriter, StatisticsService statisticsService) {
+    super(config, codec, resolver, proxy, timeSource, null, statisticsService);
     this.cacheLoaderWriter = loaderWriter;
     this.useLoaderInAtomics = true;
   }
@@ -106,6 +109,15 @@ public class ClusteredLoaderWriterStore<K, V> extends ClusteredStore<K, V> imple
     return holder;
   }
 
+  @Override
+  public boolean containsKey(K key) throws StoreAccessException {
+    try {
+      return super.getInternal(key) != null;
+    } catch (TimeoutException e) {
+      return false;
+    }
+  }
+
   private void append(K key, V value) throws TimeoutException {
     PutOperation<K, V> operation = new PutOperation<>(key, value, timeSource.getTimeMillis());
     ByteBuffer payload = codec.encode(operation);
@@ -114,7 +126,7 @@ public class ClusteredLoaderWriterStore<K, V> extends ClusteredStore<K, V> imple
   }
 
   @Override
-  protected PutStatus silentPut(K key, V value) throws StoreAccessException {
+  protected void silentPut(K key, V value) throws StoreAccessException {
     try {
       long hash = extractLongKey(key);
       boolean unlocked = false;
@@ -126,14 +138,32 @@ public class ClusteredLoaderWriterStore<K, V> extends ClusteredStore<K, V> imple
       } finally {
         getProxy().unlock(hash, unlocked);
       }
-      return PutStatus.PUT;
     } catch (Exception e) {
       throw handleException(e);
     }
   }
 
   @Override
-  protected boolean silentRemove(K key) throws StoreAccessException {
+  protected ValueHolder<V> silentGetAndPut(K key, V value) throws StoreAccessException {
+    try {
+      long hash = extractLongKey(key);
+      boolean unlocked = false;
+      final ServerStoreProxy.ChainEntry chain = getProxy().lock(hash);
+      try {
+        cacheLoaderWriter.write(key, value);
+        append(key, value);
+        unlocked = true;
+        return resolver.resolve(chain, key, timeSource.getTimeMillis());
+      } finally {
+        getProxy().unlock(hash, unlocked);
+      }
+    } catch (Exception e) {
+      throw handleException(e);
+    }
+  }
+
+  @Override
+  protected ValueHolder<V> silentRemove(K key) throws StoreAccessException {
     try {
       long hash = extractLongKey(key);
       boolean unlocked = false;
@@ -144,7 +174,7 @@ public class ClusteredLoaderWriterStore<K, V> extends ClusteredStore<K, V> imple
         cacheLoaderWriter.delete(key);
         storeProxy.append(hash, payLoad);
         unlocked = true;
-        return resolver.resolve(chain, key, timeSource.getTimeMillis()) != null;
+        return resolver.resolve(chain, key, timeSource.getTimeMillis());
       } finally {
         getProxy().unlock(hash, unlocked);
       }
@@ -300,12 +330,13 @@ public class ClusteredLoaderWriterStore<K, V> extends ClusteredStore<K, V> imple
                                                       TimeSource timeSource,
                                                       boolean useLoaderInAtomics,
                                                       Object[] serviceConfigs) {
+      StoreEventDispatcher<K, V> storeEventDispatcher = new DefaultStoreEventDispatcher<>(storeConfig.getDispatcherConcurrency());
       return new ClusteredLoaderWriterStore<>(storeConfig, codec, resolver, timeSource,
-                                              storeConfig.getCacheLoaderWriter(), useLoaderInAtomics);
+                                              storeConfig.getCacheLoaderWriter(), useLoaderInAtomics, storeEventDispatcher, getServiceProvider().getService(StatisticsService.class));
     }
 
     @Override
-    public int rank(Set<ResourceType<?>> resourceTypes, Collection<ServiceConfiguration<?>> serviceConfigs) {
+    public int rank(Set<ResourceType<?>> resourceTypes, Collection<ServiceConfiguration<?, ?>> serviceConfigs) {
       int parentRank = super.rank(resourceTypes, serviceConfigs);
       if (parentRank == 0 || serviceConfigs.stream().noneMatch(CacheLoaderWriterConfiguration.class::isInstance)) {
         return 0;
@@ -314,7 +345,7 @@ public class ClusteredLoaderWriterStore<K, V> extends ClusteredStore<K, V> imple
     }
 
     @Override
-    public int rankAuthority(ResourceType<?> authorityResource, Collection<ServiceConfiguration<?>> serviceConfigs) {
+    public int rankAuthority(ResourceType<?> authorityResource, Collection<ServiceConfiguration<?, ?>> serviceConfigs) {
       int parentRank = super.rankAuthority(authorityResource, serviceConfigs);
       if (parentRank == 0 || serviceConfigs.stream().noneMatch(CacheLoaderWriterConfiguration.class::isInstance)) {
         return 0;

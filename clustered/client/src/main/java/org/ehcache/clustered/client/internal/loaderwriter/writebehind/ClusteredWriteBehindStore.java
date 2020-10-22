@@ -32,9 +32,12 @@ import org.ehcache.clustered.common.internal.store.operations.codecs.OperationsC
 import org.ehcache.clustered.client.service.ClusteringService;
 import org.ehcache.clustered.common.internal.store.Chain;
 import org.ehcache.config.ResourceType;
+import org.ehcache.core.events.StoreEventDispatcher;
+import org.ehcache.core.spi.service.StatisticsService;
 import org.ehcache.core.spi.store.tiering.AuthoritativeTier;
 import org.ehcache.core.spi.time.TimeSource;
 import org.ehcache.core.spi.time.TimeSourceService;
+import org.ehcache.impl.store.DefaultStoreEventDispatcher;
 import org.ehcache.spi.loaderwriter.CacheLoaderWriter;
 import org.ehcache.spi.loaderwriter.WriteBehindConfiguration;
 import org.ehcache.spi.resilience.StoreAccessException;
@@ -61,8 +64,9 @@ public class ClusteredWriteBehindStore<K, V> extends ClusteredStore<K, V> implem
                                     ChainResolver<K, V> resolver,
                                     TimeSource timeSource,
                                     CacheLoaderWriter<? super K, V> loaderWriter,
-                                    ExecutorService executorService) {
-    super(config, codec, resolver, timeSource);
+                                    ExecutorService executorService,
+                                    StoreEventDispatcher<K, V> storeEventDispatcher, StatisticsService statisticsService) {
+    super(config, codec, resolver, timeSource, storeEventDispatcher, statisticsService);
     this.cacheLoaderWriter = loaderWriter;
     this.clusteredWriteBehind = new ClusteredWriteBehind<>(this, executorService,
                                                          resolver,
@@ -126,13 +130,25 @@ public class ClusteredWriteBehindStore<K, V> extends ClusteredStore<K, V> implem
   }
 
   @Override
-  protected PutStatus silentPut(final K key, final V value) throws StoreAccessException {
+  protected void silentPut(final K key, final V value) throws StoreAccessException {
     try {
       PutWithWriterOperation<K, V> operation = new PutWithWriterOperation<>(key, value, timeSource.getTimeMillis());
       ByteBuffer payload = codec.encode(operation);
       long extractedKey = extractLongKey(key);
       storeProxy.append(extractedKey, payload);
-      return PutStatus.PUT;
+    } catch (Exception re) {
+      throw handleException(re);
+    }
+  }
+
+  @Override
+  protected ValueHolder<V> silentGetAndPut(K key, V value) throws StoreAccessException {
+    try {
+      PutWithWriterOperation<K, V> operation = new PutWithWriterOperation<>(key, value, timeSource.getTimeMillis());
+      ByteBuffer payload = codec.encode(operation);
+      long extractedKey = extractLongKey(key);
+      final ServerStoreProxy.ChainEntry chain = storeProxy.getAndAppend(extractedKey, payload);
+      return resolver.resolve(chain, key, timeSource.getTimeMillis(), Integer.MAX_VALUE);
     } catch (Exception re) {
       throw handleException(re);
     }
@@ -152,13 +168,13 @@ public class ClusteredWriteBehindStore<K, V> extends ClusteredStore<K, V> implem
   }
 
   @Override
-  protected boolean silentRemove(K key) throws StoreAccessException {
+  protected ValueHolder<V> silentRemove(K key) throws StoreAccessException {
     try {
       RemoveOperation<K, V> operation = new RemoveOperation<>(key, timeSource.getTimeMillis());
       ByteBuffer payload = codec.encode(operation);
       long extractedKey = extractLongKey(key);
       ServerStoreProxy.ChainEntry chain = storeProxy.getAndAppend(extractedKey, payload);
-      return resolver.resolve(chain, key, timeSource.getTimeMillis(), Integer.MAX_VALUE) != null;
+      return resolver.resolve(chain, key, timeSource.getTimeMillis(), Integer.MAX_VALUE);
     } catch (Exception re) {
       throw handleException(re);
     }
@@ -212,13 +228,18 @@ public class ClusteredWriteBehindStore<K, V> extends ClusteredStore<K, V> implem
     }
 
     @Override
-    public void onInvalidateHash(long hash) {
-      this.delegate.onInvalidateHash(hash);
+    public void onInvalidateHash(long hash, Chain evictedChain) {
+      this.delegate.onInvalidateHash(hash, evictedChain);
     }
 
     @Override
     public void onInvalidateAll() {
       this.delegate.onInvalidateAll();
+    }
+
+    @Override
+    public void onAppend(Chain beforeAppend, ByteBuffer appended) {
+      this.delegate.onAppend(beforeAppend, appended);
     }
 
     @Override
@@ -248,23 +269,25 @@ public class ClusteredWriteBehindStore<K, V> extends ClusteredStore<K, V> implem
                                                       TimeSource timeSource,
                                                       boolean useLoaderInAtomics,
                                                       Object[] serviceConfigs) {
-      WriteBehindConfiguration writeBehindConfiguration = findSingletonAmongst(WriteBehindConfiguration.class, serviceConfigs);
+      WriteBehindConfiguration<?> writeBehindConfiguration = findSingletonAmongst(WriteBehindConfiguration.class, serviceConfigs);
       if (writeBehindConfiguration != null) {
         ExecutorService executorService =
           executionService.getOrderedExecutor(writeBehindConfiguration.getThreadPoolAlias(),
                                               new LinkedBlockingQueue<>());
+        StoreEventDispatcher<K, V> storeEventDispatcher = new DefaultStoreEventDispatcher<>(storeConfig.getDispatcherConcurrency());
         return new ClusteredWriteBehindStore<>(storeConfig,
                                                codec,
                                                resolver,
                                                timeSource,
                                                storeConfig.getCacheLoaderWriter(),
-                                               executorService);
+                                               executorService,
+                                               storeEventDispatcher, getServiceProvider().getService(StatisticsService.class));
       }
       throw new AssertionError();
     }
 
     @Override
-    protected ServerStoreProxy.ServerCallback getServerCallback(ClusteredStore<?, ?> clusteredStore) {
+    protected <K, V> ServerStoreProxy.ServerCallback getServerCallback(ClusteredStore<K, V> clusteredStore) {
       if (clusteredStore instanceof ClusteredWriteBehindStore) {
         return ((ClusteredWriteBehindStore<?, ?>)clusteredStore).getWriteBehindServerCallback(super.getServerCallback(clusteredStore));
       }
@@ -272,7 +295,7 @@ public class ClusteredWriteBehindStore<K, V> extends ClusteredStore<K, V> implem
     }
 
     @Override
-    public int rank(Set<ResourceType<?>> resourceTypes, Collection<ServiceConfiguration<?>> serviceConfigs) {
+    public int rank(Set<ResourceType<?>> resourceTypes, Collection<ServiceConfiguration<?, ?>> serviceConfigs) {
       int parentRank = super.rank(resourceTypes, serviceConfigs);
       if (parentRank == 0 || serviceConfigs.stream().noneMatch(WriteBehindConfiguration.class::isInstance)) {
         return 0;
@@ -281,7 +304,7 @@ public class ClusteredWriteBehindStore<K, V> extends ClusteredStore<K, V> implem
     }
 
     @Override
-    public int rankAuthority(ResourceType<?> authorityResource, Collection<ServiceConfiguration<?>> serviceConfigs) {
+    public int rankAuthority(ResourceType<?> authorityResource, Collection<ServiceConfiguration<?, ?>> serviceConfigs) {
       int parentRank = super.rankAuthority(authorityResource, serviceConfigs);
       if (parentRank == 0 || serviceConfigs.stream().noneMatch(WriteBehindConfiguration.class::isInstance)) {
         return 0;
